@@ -202,3 +202,161 @@ especificación, sin cambiarlas por mi cuenta, y queda como pregunta para Finanz
 validación de viajes debería ser `150.000 × díasViaje`? Si la respuesta es sí, el cambio queda
 dentro de `ValidadorMontoMaximo` sin tocar ningún otro eslabón ni estrategia, y eso confirma que
 la separación por patrones funciona.
+
+---
+
+## Parte 2 — Decisión arquitectónica y análisis de impacto
+
+### Decisión de diseño 3 — Resumen de [ADR-001](docs/adr/ADR-001.md): capas simples para persistencia; el seam de notificación ya cubre el próximo cambio conocido
+
+**Estado:** Aceptado — 2026-11-04. El ADR completo (contexto, alternativas, decisión,
+consecuencias y señales de revisión) está en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md).
+
+| Dependencia | Criterio de la Guía 6.2: "≥ 3 años **con cambios de infraestructura**" | Decisión |
+|---|---|---|
+| **Persistencia** | **No se cumple**: no hay ningún plan de cambiar de motor, JPA ya abstrae el motor relacional, hay 1 repositorio con 3 métodos y 1 solo consumidor | **Capas simples**: el servicio sigue usando `RepositorioSolicitudesJpa`, sin puerto `RepositorioSolicitudes` ni adaptador |
+| **Notificación** | **Se cumple**: Contabilidad anunció una API externa de pagos para el próximo trimestre | **Sin cambios**: `ObservadorCambioEstado` ya es el *seam*; solo cambiará el interior de `NotificadorContabilidad` |
+
+- **Positivas:** cero interfaces o *mappers* especulativos; el único cambio con fecha ya tiene su
+  punto de extensión y su prueba de regresión; ArchUnit protege los límites que sí existen.
+- **Negativas:** si algún día hay que cambiar a un almacén no relacional, el puerto se introduce
+  retroactivamente (deuda aceptada y acotada a un consumidor); la asimetría puede parecer
+  inconsistente a quien no lea el ADR; la llamada a la API de pagos será síncrona.
+
+### Reglas de arquitectura (`ReglasArquitectura`, ArchUnit 1.2.1)
+
+| Regla | Qué protege |
+|---|---|
+| `procesamientoSinPersistenciaNiWeb` | Los patrones no dependen de `infraestructura`, `adaptadores`, `org.springframework.data` ni `jakarta.persistence` |
+| `controladorSoloUsaServicio` | El adaptador REST solo usa `aplicacion`, `dominio`, Spring Web/HTTP y `java..` (nunca el repositorio) |
+| `calculadorasImplementanInterfaz` | Toda `Calculadora*` del paquete `calculo` es una estrategia `CalculadoraReembolso` |
+| `notificadoresImplementanInterfaz` | Toda clase concreta de `notificacion` es un `ObservadorCambioEstado` |
+
+**Hallazgo al ejecutarlas:** copiadas tal cual del enunciado, **2 de las 4 fallaban** sobre un
+código que sí respeta la arquitectura:
+
+![Reglas del enunciado sin ajustar](docs/capturas/06-reglas-enunciado-rojo.png)
+
+1. **Regla 2:** `onlyAccessClassesThat()` también cuenta como acceso que el controlador lea su
+   **propio campo** `servicio` (`gets field SolicitudReembolsoController.servicio`), y esa clase vive
+   en `adaptadores.rest`, que no estaba en la lista blanca. Se agregó `"..adaptadores.rest.."` a
+   los paquetes permitidos, lo que además permite que `ManejadorErrores` conviva en el mismo paquete.
+2. **Regla 3:** `SelectorCalculadora` vive en `procesamiento.calculo` pero no es una estrategia:
+   es quien las elige. Se refinó el filtro con la convención de nombres
+   `.haveSimpleNameStartingWith("Calculadora")` en vez de mover el selector a otro paquete, porque
+   el selector forma parte del mecanismo Strategy y le corresponde estar con sus estrategias.
+3. Además se usa `ImportOption.DoNotIncludeTests`: sin esa opción, `CalculadoraViajeTest` (que
+   vive en el paquete `calculo` y empieza por "Calculadora") se evaluaría como si fuera una
+   estrategia.
+
+Con los ajustes, las 4 reglas pasan:
+
+![Reglas en verde](docs/capturas/07-reglas-verde.png)
+
+### Decisión de diseño 4 — La Regla 1 prohíbe Spring Data y JPA, no todo `org.springframework`
+
+**Elegí una prohibición selectiva**: `procesamiento` puede usar las anotaciones de estereotipo de
+Spring (`@Component`), pero no las clases de acceso a datos (`org.springframework.data..`,
+`jakarta.persistence..`), ni `infraestructura` o `adaptadores`.
+
+- **Lo que importa es qué tipo de dependencia es, no de qué framework viene.** `@Component` es
+  *metadato*: no se invoca, no cambia el comportamiento del validador y no ata el código a ningún
+  recurso externo. Prueba de ello: todas las pruebas unitarias de procesamiento hacen
+  `new ValidadorDuplicados()` / `new CalculadoraViaje()` **sin levantar Spring** y funcionan
+  igual. Si mañana se quitara Spring, borrar la anotación sería un cambio mecánico que no toca
+  ninguna regla de negocio.
+- **`JpaRepository`, `EntityManager` o `@Entity` sí son dependencias de comportamiento y de
+  infraestructura:** obligarían a tener una base de datos para probar un validador, meterían I/O
+  dentro de una cadena que hoy es pura y en memoria, y acoplarían las reglas de negocio al motor
+  de persistencia. Eso es justo lo que la Regla 1 debe impedir (y lo que la violación intencional
+  del Paso 5 demuestra).
+- **Prohibir todo `org.springframework` sería una regla imposible de cumplir sin pagar un costo
+  real:** habría que quitar `@Component` y registrar los 11 *beans* de procesamiento a mano en una
+  clase `@Configuration` (en otro paquete). Eso suma código de ensamblaje y no aporta desacoplamiento
+  real, porque la anotación no genera acoplamiento de comportamiento. Una regla que obliga a
+  escribir código ceremonial no pasa el test de explicabilidad.
+- **Costo asumido:** la regla es una lista negra; si apareciera otra tecnología de persistencia
+  (por ejemplo `org.springframework.jdbc`), habría que agregarla a la lista.
+
+---
+
+## Qué se descartó y por qué
+
+Para cada idea se aplicó el criterio de la Guía (sección 4.2): ¿la variabilidad que la
+justificaría es **real y está documentada hoy**, o es especulación sobre un futuro que aún no
+llegó? Ningún descarte es definitivo: cada uno indica la señal que haría reconsiderarlo.
+
+### 1. `ApplicationEventPublisher` en vez de una lista de observadores inyectada *(ejemplo de referencia)*
+
+- **Qué se consideró:** publicar un evento de dominio (`SolicitudCambioEstadoEvent`) con
+  `ApplicationEventPublisher` y reaccionar con `@EventListener`, en lugar de inyectar
+  `List<ObservadorCambioEstado>` en el servicio.
+- **Por qué se descartó:** con tres observadores fijos y conocidos en tiempo de compilación, un
+  bus de eventos genérico no aporta desacoplamiento real (ya lo da `ObservadorCambioEstado`) y
+  sí hace más difícil rastrear en el código quién reacciona a qué cambio, que es el costo de
+  depuración que la Guía advierte sobre Observer con eventos.
+- **Señal para reconsiderar:** necesitar notificación **asíncrona o transaccional**
+  (`@TransactionalEventListener` para notificar solo si el *commit* fue exitoso), o que otros
+  módulos fuera de este servicio quieran reaccionar al mismo evento.
+
+### 2. Visitor o Abstract Factory para exportar reportes en varios formatos *(ejemplo de referencia)*
+
+- **Qué se consideró:** anticipar que Contabilidad pediría PDF y Excel además de CSV y construir
+  ya una jerarquía de exportadores.
+- **Por qué se descartó:** hoy solo existe un requisito de exportación (CSV). Sin una segunda
+  solicitud real no se cumple la **Rule of Three**, así que construir la abstracción sería resolver
+  un problema que todavía no existe.
+- **Señal para reconsiderar:** la segunda solicitud de un formato distinto (ahí se extrae una
+  interfaz `ExportadorSolicitudes`) y la tercera para generalizar del todo.
+
+### 3. Carga perezosa de las pendientes con `Supplier<List<SolicitudReembolso>>` *(elemento propio)*
+
+- **Qué se consideró:** al escribir la Decisión de diseño 1 noté que el servicio consulta
+  `findByEmpleadoIdAndEstado` **siempre**, incluso cuando la solicitud se rechazará gratis en el
+  primer eslabón por no tener documentos. Pensé en cambiar la firma de la cadena a
+  `validar(solicitud, Supplier<List<SolicitudReembolso>> pendientes)` (o una caché con
+  *memoization*) para que solo `ValidadorDuplicados` disparara la consulta.
+- **Por qué se descartó:**
+  - **YAGNI / sin evidencia:** la consulta es un `SELECT` por empleado y estado sobre una tabla
+    pequeña; no hay ninguna medición ni queja de rendimiento que justifique optimizarla.
+  - **Test de explicabilidad:** "¿por qué la cadena recibe un `Supplier`?" → "para ahorrar una
+    consulta barata en las solicitudes que se rechazan por falta de documentos". La respuesta no
+    se sostiene frente al costo.
+  - **Costo real:** cambia la firma de `ValidadorSolicitud` y de los 3 eslabones y sus 4 pruebas,
+    y obliga a pensar en la evaluación diferida (¿se llama una vez o varias?).
+- **Señal para reconsiderar:** que una medición (por ejemplo, métricas de latencia en el panel
+  que pidió Finanzas) muestre que esa consulta pesa en el `POST`, o que aparezca el validador de
+  "límite anual acumulado" con su propia consulta costosa. En ese punto convendría que cada
+  eslabón cargue solo lo que necesita.
+
+### 4. Patrón State para las transiciones de `EstadoSolicitud` *(elemento propio)*
+
+- **Qué se consideró:** como `cambiarEstado` recibe cualquier estado, pensé en modelar
+  `PENDIENTE`, `APROBADA`, `RECHAZADA` y `REQUIERE_CORRECCION` como clases *State* con métodos
+  `aprobar()`, `rechazar()` y `pedirCorreccion()`, de modo que cada estado decida qué transiciones
+  permite (por ejemplo, impedir que una `RECHAZADA` vuelva a `APROBADA`).
+- **Por qué se descartó:** la especificación **no define ninguna regla de transición**. Solo dice
+  que al cambiar de estado se debe notificar (RF3). Implementar State sería inventar reglas de
+  negocio que Finanzas no pidió y agregar 4 clases más una interfaz para un comportamiento que hoy
+  es una asignación. Tampoco hay comportamiento que dependa del estado (el único que lo consulta
+  es `NotificadorContabilidad`, y lo hace con un `if` simple dentro de su propio observador).
+- **Señal para reconsiderar:** que Finanzas defina un **flujo de aprobación** con reglas por estado
+  (por ejemplo, "solo una solicitud en `REQUIERE_CORRECCION` puede volver a `PENDIENTE`",
+  aprobación en dos niveles o reglas por monto). Si solo se piden 2 o 3 transiciones prohibidas,
+  primero bastaría un `Map<EstadoSolicitud, Set<EstadoSolicitud>>` de transiciones válidas en el
+  enum; State se justificaría cuando cada estado tenga **comportamiento** propio, no solo
+  transiciones permitidas.
+
+### 5. Una excepción por validador en vez de una sola `SolicitudInvalidaException` *(elemento propio)*
+
+- **Qué se consideró:** crear `DocumentosFaltantesException`, `MontoExcedidoException` y
+  `SolicitudDuplicadaException` para que el controlador respondiera algo distinto en cada caso.
+- **Por qué se descartó:** hoy los tres casos se manejan **igual** (HTTP 400 con el motivo como
+  texto), así que tres clases no cambian ningún comportamiento observable. Además, la cadena ya
+  modela el resultado como dato (`ResultadoValidacion`). Una jerarquía de excepciones duplicaría
+  esa información y obligaría a tocar el controlador por cada validador nuevo, que es justo lo
+  contrario de lo que pide RF1.
+- **Señal para reconsiderar:** que el *frontend* necesite reaccionar de forma distinta según el
+  motivo (por ejemplo, abrir el diálogo de adjuntar documentos). Aun así, primero bastaría un
+  **código de motivo** (`enum MotivoRechazo`) dentro de `ResultadoValidacion`, sin crear
+  excepciones nuevas.
