@@ -63,3 +63,142 @@ com.empresa.reembolsos
 ├── infraestructura/               RepositorioSolicitudesJpa (Spring Data JPA)
 └── adaptadores/rest/              SolicitudReembolsoController
 ```
+
+---
+
+## Parte 1 — Implementación
+
+### Arquitectura resultante
+
+```mermaid
+graph TD
+    REST[adaptadores.rest<br/>SolicitudReembolsoController<br/>ManejadorErrores] --> APP[aplicacion<br/>SolicitudReembolsoService]
+    APP --> VAL[procesamiento.validacion<br/>CadenaValidadores → Documentos → Monto → Duplicados]
+    APP --> CAL[procesamiento.calculo<br/>SelectorCalculadora → Viaje / Representacion / Capacitacion]
+    APP --> NOT[procesamiento.notificacion<br/>List&lt;ObservadorCambioEstado&gt; → Empleado / Contabilidad / Auditoria]
+    APP --> INF[infraestructura<br/>RepositorioSolicitudesJpa]
+    VAL --> DOM[dominio<br/>SolicitudReembolso · CategoriaGasto · EstadoSolicitud]
+    CAL --> DOM
+    NOT --> DOM
+    INF --> DOM
+```
+
+| Paquete | Responsabilidad | Depende de |
+|---|---|---|
+| `dominio` | Modelo puro (`SolicitudReembolso`, enums). **No importa Spring ni JPA.** | nada |
+| `procesamiento.validacion` | RF1 — Chain of Responsibility | `dominio` + estereotipo `@Component` |
+| `procesamiento.calculo` | RF2 — Strategy + selector por mapa | `dominio` + `@Component` |
+| `procesamiento.notificacion` | RF3 — Observer | `dominio` + `@Component`, SLF4J |
+| `aplicacion` | Coordina los 3 patrones y la persistencia; excepciones de aplicación | todos los anteriores + `infraestructura` |
+| `infraestructura` | `RepositorioSolicitudesJpa` (Spring Data) + mapeo `META-INF/orm.xml` | `dominio`, Spring Data |
+| `adaptadores.rest` | API REST y traducción de errores a HTTP 400/404 | `aplicacion`, `dominio`, Spring Web |
+
+**Nota de implementación — dominio sin JPA:** la especificación pide que `SolicitudReembolso` no
+dependa de JPA, pero `RepositorioSolicitudesJpa extends JpaRepository<SolicitudReembolso, Long>`
+necesita que la clase sea una entidad. Lo resolví con un **mapeo XML** en
+`src/main/resources/META-INF/orm.xml` (tabla, id autogenerado, enums como `STRING`, precisión de
+montos): el dominio queda como Java puro y el detalle de persistencia vive del lado de la
+infraestructura.
+
+**Nota de implementación — periodo de duplicados:** el ejemplo del enunciado comparaba solo
+`getMonth()`, así que octubre de 2025 y octubre de 2026 se tomaban como el mismo periodo. Lo cambié
+por `YearMonth` (mes **y** año); `ValidadorDuplicadosTest` cubre ese caso.
+
+### Evidencia de funcionamiento (aplicación real con `java -jar`, H2 en memoria)
+
+**RF2 — `POST /api/solicitudes` en las 3 categorías, con monto aprobado calculado:**
+VIAJE 140.000 (1 día, tope 150.000) → 140.000 · REPRESENTACIÓN 1.800.000 → 1.800.000 ·
+CAPACITACIÓN 2.500.000 → 80 % = 2.000.000.
+
+![POST tres categorias](docs/capturas/01-post-tres-categorias.png)
+
+**RF1 — rechazos con mensaje claro (HTTP 400):** sin documentos, monto sobre el tope, y
+duplicado pendiente de la misma categoría y periodo.
+
+![POST rechazos](docs/capturas/02-post-rechazos.png)
+
+**RF3 — `PUT /api/solicitudes/{id}/estado` dispara los tres observadores.** Contabilidad solo
+reacciona a `APROBADA`; empleado y auditoría reaccionan a todo cambio:
+
+![PUT estado y observadores](docs/capturas/03-put-estado-observadores.png)
+
+**`ValidadorDuplicados` no importa infraestructura ni Spring Data, y `dominio` no importa Spring ni JPA:**
+
+![grep de imports](docs/capturas/04-imports-validador-duplicados.png)
+
+### Pruebas de la Parte 1
+
+| Tipo | Clase | Pruebas |
+|---|---|---|
+| Unitaria (validador) | `ValidadorDocumentosSoporteTest` | 1 |
+| Unitaria (validador) | `ValidadorMontoMaximoTest` (parametrizada, 3 categorías × límite) | 6 |
+| Unitaria (validador) | `ValidadorDuplicadosTest` | 2 |
+| Unitaria (cadena) | `CadenaValidadoresTest` (orden y corte de la cadena) | 3 |
+| Unitaria (calculadora) | `CalculadoraViajeTest`, `CalculadoraRepresentacionTest`, `CalculadoraCapacitacionTest` | 3 |
+| Unitaria (selector) | `SelectorCalculadoraTest` | 2 |
+| Unitaria (observadores) | `NotificadoresTest` | 3 |
+| **Integración `@SpringBootTest`** | `FlujoSolicitudReembolsoIntegracionTest` (MockMvc + H2 + `@SpyBean` de los 3 observadores) | 4 |
+| | **Total** | **24** |
+
+![mvn clean package](docs/capturas/05-mvn-test-parte1.png)
+
+---
+
+## Decisiones de diseño
+
+### Decisión de diseño 1 — Orden de la cadena de validadores
+
+**Orden elegido: `documentos → monto → duplicados`** (de más barato a más caro).
+
+| Eslabón | Costo | Por qué en esa posición |
+|---|---|---|
+| 1. `ValidadorDocumentosSoporte` | O(1): leer un `boolean` | Es el más barato y el rechazo más frecuente esperable (olvidar adjuntar soportes) |
+| 2. `ValidadorMontoMaximo` | O(1): buscar en un `Map` y una comparación `BigDecimal` | Barato; descarta montos imposibles antes de mirar el historial |
+| 3. `ValidadorDuplicados` | O(n): recorre la lista de pendientes del empleado y construye un `YearMonth` por elemento | Es el más caro, así que va **último**: solo corre si los otros dos aprobaron |
+
+**Qué se gana con el más caro al final:** como la cadena corta en el primer rechazo, toda
+solicitud que falla por documentos o por monto nunca llega a recorrer la lista; el costo O(n) solo
+se paga cuando la solicitud ya es válida en lo demás. En general, con eslabones independientes
+conviene ordenar por *costo ascendente* y, a igual costo, por *probabilidad de rechazo descendente*.
+
+**Qué se pierde:** (1) el empleado recibe **un solo motivo** a la vez: si su solicitud está
+duplicada *y* no tiene soportes, primero corrige los soportes y solo al reenviar se entera del
+duplicado; (2) el mensaje que ve depende del orden de la cadena, lo que se documenta en
+`CadenaValidadoresTest.elPrimerEslabonQueFallaCortaLaCadena`.
+
+**Con el orden inverso (duplicados primero)** se ganaría avisar antes del caso "ya lo enviaste",
+pero se pagaría el recorrido O(n) en *todas* las solicitudes, incluso en las que se rechazarían
+gratis por un booleano.
+
+**Matiz honesto:** con el diseño actual, la consulta a BD
+(`findByEmpleadoIdAndEstado`) la hace el servicio **antes** de entrar a la cadena, así que el
+ahorro del orden es de CPU en memoria, no de I/O. Hacer perezosa esa consulta se evaluó y se
+descartó (ver "Qué se descartó y por qué", punto 3).
+
+### Decisión de diseño 2 — Selección de la calculadora: mapa inyectado vs. `switch`
+
+**Elegí el mapa construido a partir de `List<CalculadoraReembolso>` que Spring inyecta.**
+
+- **Cumple RF2 al pie de la letra:** para agregar "bienestar" se crea `CalculadoraBienestar`
+  con `@Component` y se agrega la constante al enum (que es un dato del dominio, no un cálculo).
+  **No se modifica ninguna línea** de `SelectorCalculadora`, del servicio ni de las otras tres
+  calculadoras: Spring la descubre y `toMap` la registra al arrancar.
+- Con un `switch` manual sobre `CategoriaGasto`, cada categoría nueva obliga a **editar el
+  selector** (viola OCP), y si se olvida, el error aparece en ejecución.
+- **Falla rápido ante errores de configuración:** si dos calculadoras declaran la misma
+  categoría, `Collectors.toMap` lanza `IllegalStateException` al arrancar el contexto. Si falta
+  una, `obtener()` responde con un mensaje explícito (`SelectorCalculadoraTest`).
+- Costo asumido: el vínculo categoría→clase ya no se ve en un solo `switch`; hay que mirar el
+  `getCategoria()` de cada estrategia. Lo acepto porque es justo la información que cada
+  estrategia debe conocer de sí misma.
+
+### Observación para Finanzas (hallazgo durante la implementación)
+
+`ValidadorMontoMaximo` usa para VIAJE un tope **por solicitud** de 150.000, y `CalculadoraViaje`
+usa 150.000 como tope **diario** multiplicado por los días. Así, un viaje de 3 días por 400.000
+(dentro del tope de cálculo, 450.000) se **rechaza** en la validación, y el `min()` de la
+calculadora nunca llega a recortar nada. Implementé las reglas tal como están en la
+especificación, sin cambiarlas por mi cuenta, y queda como pregunta para Finanzas: ¿el tope de
+validación de viajes debería ser `150.000 × díasViaje`? Si la respuesta es sí, el cambio queda
+dentro de `ValidadorMontoMaximo` sin tocar ningún otro eslabón ni estrategia, y eso confirma que
+la separación por patrones funciona.
