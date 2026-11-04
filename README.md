@@ -10,6 +10,21 @@
 Proyecto Maven / Spring Boot 3 (Java 17, Spring Web, Spring Data JPA, H2) ubicado en la raíz
 del repositorio: `com.empresa:reembolsos-integrado`, paquete base `com.empresa.reembolsos`.
 
+```bash
+mvn verify                          # 28 pruebas: 24 unitarias/integracion + 4 reglas ArchUnit
+mvn test -Dtest=ReglasArquitectura  # solo las 4 reglas de arquitectura
+mvn spring-boot:run                 # API en http://localhost:8080/api/solicitudes
+```
+
+**Contenido de este documento de diseño**
+
+1. [Diseño Propuesto](#diseño-propuesto) (escrito antes del código)
+2. [Parte 1 — Implementación](#parte-1--implementación): arquitectura resultante, evidencia y pruebas
+3. [Decisiones de diseño 1 y 2](#decisiones-de-diseño): orden de la cadena y selector de estrategias
+4. [Parte 2](#parte-2--decisión-arquitectónica-y-análisis-de-impacto): Decisión 3 (resumen de [ADR-001](docs/adr/ADR-001.md)), reglas ArchUnit y Decisión 4
+5. [Qué se descartó y por qué](#qué-se-descartó-y-por-qué)
+6. [Evidencia del pipeline de GitHub Actions](#evidencia-del-pipeline-de-github-actions)
+
 ---
 
 ## Diseño Propuesto
@@ -360,3 +375,78 @@ llegó? Ningún descarte es definitivo: cada uno indica la señal que haría rec
   motivo (por ejemplo, abrir el diálogo de adjuntar documentos). Aun así, primero bastaría un
   **código de motivo** (`enum MotivoRechazo`) dentro de `ResultadoValidacion`, sin crear
   excepciones nuevas.
+
+---
+
+## Evidencia del pipeline de GitHub Actions
+
+Workflow [`.github/workflows/arquitectura.yml`](.github/workflows/arquitectura.yml) (“Validacion
+Arquitectonica”): en cada `push`/`pull_request` a `main` ejecuta primero
+`mvn test -Dtest=ReglasArquitectura` y después `mvn verify`.
+
+**Hallazgo al configurarlo:** `ReglasArquitectura` no termina en `*Test`, así que Surefire **no la
+incluía** en `mvn verify` (la suite completa corría 24 pruebas en vez de 28). Se agregó en el
+`pom.xml` un `<include>**/ReglasArquitectura.java</include>` para que las reglas también formen
+parte de la suite completa y no dependan solo del paso con `-Dtest`.
+
+### Prueba de la violación intencional (Paso 5)
+
+1. Commit `8bb2551` — **`test: violacion de arquitectura intencional`**: se agregó a
+   `ValidadorDuplicados` un campo `private RepositorioSolicitudesJpa repositorio;`.
+   *Nota:* un `import` sin uso no basta, porque el compilador lo descarta, no queda en el
+   *bytecode* y ArchUnit (que analiza `.class`) no lo vería. Por eso la violación se hace con un campo.
+2. El pipeline **falló** en el paso *Ejecutar reglas de arquitectura* con la regla
+   `procesamientoSinPersistenciaNiWeb`, y el paso de la suite completa quedó *skipped*.
+3. Commit `c3b79f5` — `git revert HEAD`: el pipeline **volvió a verde** (4/4 reglas y 28/28 pruebas).
+
+| Run | Commit | Resultado |
+|---|---|---|
+| [#1](https://github.com/Paula-Preciado/munoz-post1-u12/actions/runs/41763799148) | `1aef0ce` Parte 2 completa | ✅ success |
+| [#2](https://github.com/Paula-Preciado/munoz-post1-u12/actions/runs/41763944122) | `8bb2551` violación intencional | ❌ failure — `procesamientoSinPersistenciaNiWeb` |
+| [#3](https://github.com/Paula-Preciado/munoz-post1-u12/actions/runs/41764007249) | `c3b79f5` revert | ✅ success |
+
+**Historial de ejecuciones** (generado con los datos de la API pública de GitHub
+`/actions/runs` y `/jobs`; cada fila enlaza a la ejecución real en la pestaña *Actions*):
+
+![Historial de GitHub Actions](docs/capturas/08-actions-historial.png)
+
+**Log real del job fallido** (descargado de `/actions/jobs/{id}/logs`):
+
+![Log del build fallido](docs/capturas/09-ci-log-rojo.png)
+
+**Log real del job en verde tras el revert:**
+
+![Log del build en verde](docs/capturas/10-ci-log-verde.png)
+
+Las advertencias del *runner* sobre Node.js 20 en `actions/checkout@v4`, `setup-java@v4` y
+`cache@v4` son avisos de deprecación de GitHub, no errores. El workflow usa `actions/cache@v4`
+en lugar del `@v3` del enunciado porque las versiones anteriores del servicio de caché fueron
+retiradas por GitHub.
+
+---
+
+## Historial de commits
+
+![git log](docs/capturas/11-git-log.png)
+
+| Parte | Commit |
+|---|---|
+| 1 | `docs: analizar requisitos y proponer diseno de patrones antes de implementar` |
+| 1 | `feat: implementar cadena de validadores para las solicitudes de reembolso` |
+| 1 | `feat: implementar estrategias de calculo por categoria de gasto` |
+| 1 | `feat: implementar notificacion a interesados ante cambios de estado` |
+| 1 | `feat: ensamblar SolicitudReembolsoService y el controlador REST` |
+| 1 | `docs: documentar decisiones de diseno 1 y 2 y evidencia de la Parte 1` |
+| 2 | `docs: agregar ADR-001 con la decision arquitectonica de persistencia y notificacion` |
+| 2 | `test: agregar dependencia ArchUnit y las 4 reglas de arquitectura en ReglasArquitectura` |
+| 2 | `ci: agregar workflow de GitHub Actions para validacion arquitectonica` |
+| 2 | `docs: documentar analisis de impacto y patrones descartados por sobreingenieria` |
+| 2 | `build: incluir ReglasArquitectura en la suite de surefire para que mvn verify ejecute las reglas` |
+| 2 | `docs: agregar capturas de las reglas ArchUnit en rojo y en verde` |
+| 2 | `test: violacion de arquitectura intencional` (pipeline ❌) |
+| 2 | `Revert "test: violacion de arquitectura intencional"` (pipeline ✅) |
+| 2 | `docs: consolidar README con diseno propuesto, decisiones, ADR y analisis de impacto` |
+
+---
+
+**Paula Andrea Muñoz Preciado — 02230131025**
