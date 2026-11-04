@@ -1,7 +1,6 @@
 package com.empresa.reembolsos.procesamiento.validacion;
 
 import com.empresa.reembolsos.dominio.SolicitudReembolso;
-import com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa;
 import org.springframework.stereotype.Component;
 
 import java.time.YearMonth;
@@ -16,10 +15,6 @@ import java.util.List;
  */
 @Component
 public class ValidadorDuplicados extends ValidadorSolicitud {
-
-    // VIOLACION INTENCIONAL (Parte 2, Paso 5): procesamiento depende de infraestructura.
-    // Se usa como campo porque un import sin uso no queda en el bytecode y ArchUnit no lo ve.
-    private RepositorioSolicitudesJpa repositorio;
 
     @Override
     protected ResultadoValidacion validarPropio(SolicitudReembolso solicitud, List<SolicitudReembolso> pendientes) {
